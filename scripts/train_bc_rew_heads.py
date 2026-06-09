@@ -23,10 +23,21 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
+TBWriter = None
+try:
+    from torch.utils.tensorboard import SummaryWriter as _TBWriter
+    TBWriter = _TBWriter
+except Exception:
+    try:
+        from tensorboardX import SummaryWriter as _TBWriter  # type: ignore
+        TBWriter = _TBWriter
+    except Exception:
+        TBWriter = None
 
 # UPDATED: bring in heads + task embedder
 from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
 from dreamer.data import make_iterator
+from dreamer.offline_data import make_offline_iterator_npz_multi
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -57,7 +68,7 @@ class RealismConfig:
     wandb_entity: str | None = None  # if None, uses default entity
     wandb_project: str | None = None  # if None, uses run_name as project
 
-    # data
+    # data (synthetic or offline)
     B: int = 64
     T: int = 64
     H: int = 32
@@ -69,7 +80,15 @@ class RealismConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
-    action_dim: int = 4 # number of categorical actions
+    # 对于 Meta-World，我们使用离线 npz 数据集：
+    #   - data_dir 指向 npz 所在目录
+    #   - video_key / action_key / reward_key 对应数组名
+    data_dir: str | None = None
+    video_key: str = "videos"
+    action_key: str = "actions"
+    reward_key: str = "rewards"
+    # 动作维度：对于 Meta-World 连续动作就是 action 向量维数
+    action_dim: int = 4
 
     # tokenizer / dynamics config
     patch: int = 4
@@ -95,14 +114,14 @@ class RealismConfig:
 
     # train
     max_steps: int = 1_000_000_000
-    log_every: int = 5_000
+    log_every: int = 100
     lr: float = 3e-4
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
     # NEW: multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
+    L: int = 8                     # predict next L actions/rewards
     num_reward_bins: int = 101      # twohot bins for symexp rewards
     reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
     reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
@@ -228,25 +247,33 @@ def _twohot_symlog_targets(values, centers_log):
     oh_r = jax.nn.one_hot(idx_r, K)
     return oh_l * (1.0 - frac)[..., None] + oh_r * frac[..., None]
 
-def _gather_future_actions(labels_bt, L):
+def _gather_future_actions_continuous(actions_bta, L: int):
     """
-    labels_bt: (B, T) int class ids
-    returns: labels_btL (B, T, L) and mask_btL (B, T, L) where mask=0 for out-of-range (t+n>=T)
-    
-    At timestep t, predicts actions[t+1], actions[t+2], ..., actions[t+L]
-    (following Dreamer convention: action a_i happens before state s_i)
+    用于连续动作的多步 BC：
+      actions_bta: (B, T, A) 连续动作向量
+    返回:
+      actions_btLA: (B, T, L, A)  —— 在时间 t 处预测 t+1,...,t+L 的动作
+      valid_btL:    (B, T, L)     —— 对于越界的 (t+n>=T) 位置为 False
     """
-    B, T = labels_bt.shape
-    labels_pad = jnp.pad(labels_bt, ((0,0),(0,L)), constant_values=-1)
-    
-    # Vectorized version: use advanced indexing instead of list comprehension
-    # Create indices for all L offsets at once
-    # Offsets start at 1 because we predict the NEXT L actions (t+1, t+2, ..., t+L)
-    offsets = jnp.arange(1, L+1)  # (L,) = [1, 2, ..., L]
-    indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
-    labels_btL = labels_pad[:, indices]  # (B, T, L) - JAX broadcasts batch dim
-    valid_btL = (labels_btL >= 0)
-    return labels_btL, valid_btL
+    B, T, A = actions_bta.shape
+    # 在时间维后面补 L 帧，方便索引 t+offset
+    actions_pad = jnp.pad(actions_bta, ((0, 0), (0, L), (0, 0)))
+
+    slices = []
+    valids = []
+    for n in range(L):
+        offset = n + 1  # 预测 t+1,...,t+L
+        idx = jnp.arange(T) + offset  # (T,)
+        # 越界的 index 会落在 padding 区，后面用 valid_btL 掩掉
+        slice_n = actions_pad[:, idx, :]  # (B, T, A)
+        valid_n = (idx < T)               # (T,)
+        slices.append(slice_n)
+        valids.append(valid_n)
+
+    actions_btLA = jnp.stack(slices, axis=2)   # (B, T, L, A)
+    valid_btL_TL = jnp.stack(valids, axis=1)   # (T, L)
+    valid_btL = jnp.broadcast_to(valid_btL_TL[None, :, :], (B, T, L))
+    return actions_btLA, valid_btL
 
 def _gather_future_rewards(values_bt, L):
     """
@@ -421,18 +448,23 @@ def train_step_efficient(
             lambda: (jnp.array(0.0, dtype=z1.dtype), jnp.array(0.0, dtype=z1.dtype)),
         )
 
-        # ---------- MTP: Policy (categorical CE over next L actions) ----------
-        # logits: (B,T,L,A)
-        pi_logits = policy_head.apply(local_pi, h_pooled_btd, rngs={"dropout": drop_pi}, deterministic=False)
+        # ---------- MTP: Policy (连续动作的 L 步 BC - MSE) ----------
+        # 这里将 PolicyHeadMTP 输出解释为未来 L 步动作的均值向量：
+        #   pi_pred: (B, T, L, A_dim)
+        pi_pred = policy_head.apply(local_pi, h_pooled_btd, rngs={"dropout": drop_pi}, deterministic=False)
 
-        labels_btL, valid_btL = _gather_future_actions(actions_full, L)  # (B,T,L), (B,T,L)
-        logp = jax.nn.log_softmax(pi_logits, axis=-1)                # (B,T,L,A)
-        A = logp.shape[-1]
-        safe_labels = jnp.where(valid_btL, labels_btL, 0)
-        tgt = jax.nn.one_hot(safe_labels, A) * valid_btL[..., None]  # (B,T,L,A)
-        nll = -jnp.sum(tgt * logp, axis=-1)                          # (B,T,L)
+        # 从真实动作序列中取未来 L 步连续动作作为监督信号
+        # actions_full: (B, T, A_dim)
+        if actions_full.ndim == 2:
+            # 万一还是离散 id，这里转成 float 再视为 1 维连续动作
+            actions_cont = actions_full[..., None].astype(jnp.float32)
+        else:
+            actions_cont = actions_full.astype(jnp.float32)
+
+        tgt_btLA, valid_btL = _gather_future_actions_continuous(actions_cont, L)  # (B,T,L,A),(B,T,L)
+        err_sq = jnp.mean((pi_pred - tgt_btLA) ** 2, axis=-1)                     # (B,T,L)
         denom = jnp.maximum(valid_btL.sum(), 1)
-        pi_ce = jnp.sum(nll) / denom
+        pi_ce = jnp.sum(err_sq * valid_btL) / denom                               # 标记为 pi_ce 以兼容下游日志
 
         # ---------- MTP: Reward (symexp twohot CE over current and future L rewards) ----------
         # rewards: (B, T) where rewards[:, 0] = r0 (dummy, invalid)
@@ -692,9 +724,18 @@ def load_pretrained_dynamics_params(ckpt_dir: str, dyn_vars: dict) -> dict:
     restored = try_restore(mngr, state_example, meta_example={})
     if restored is None:
         raise FileNotFoundError(f"No dynamics checkpoint found in {ckpt_dir}")
-    _, r = restored
-    p = r.state["params"]
-    return p["dyn"] if isinstance(p, dict) and "dyn" in p else p
+    try:
+        _, r = restored
+        p = r.state["params"]
+        return p["dyn"] if isinstance(p, dict) and "dyn" in p else p
+    except ValueError as e:
+        # If the dynamics architecture changed (e.g. ActionEncoder modified),
+        # old checkpoints may be incompatible with the current param tree.
+        # In that case, fall back to the freshly initialized params so that
+        # training can proceed, and print a warning.
+        print(f"[warn] dynamics checkpoint in {ckpt_dir} is incompatible with current model ({e}).")
+        print("[warn] Falling back to newly initialized dynamics parameters for BC+Reward training.")
+        return dyn_vars["params"]
 
 def initialize_models_and_tokenizer(
     cfg: RealismConfig,
@@ -830,6 +871,7 @@ def run_evaluation(
     train_state: TrainState,
     next_batch,
     vis_dir: Path,
+    tb_writer=None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -874,6 +916,12 @@ def run_evaluation(
         save_evaluation_video(grid_frames, mp4_path, tag)
         print(f"[eval:{tag}] wrote {mp4_path.name} in {tag_dir}")
 
+        if tb_writer is not None:
+            tb_writer.add_scalar(f"eval/{tag}/mse", mse, step)
+            tb_writer.add_scalar(f"eval/{tag}/psnr", psnr, step)
+            tb_writer.add_scalar(f"eval/{tag}/horizon", HZ, step)
+            tb_writer.add_scalar(f"eval/{tag}/eval_time", dt, step)
+
         if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
             wandb.log({
                 f"eval/{tag}/mse": mse,
@@ -912,19 +960,72 @@ def run(cfg: RealismConfig):
     run_dir = _ensure_dir(root / cfg.run_name)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
+    tb_dir = _ensure_dir(run_dir / "tb")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+    if TBWriter is not None:
+        tb_writer = TBWriter(log_dir=str(tb_dir))
+        print(f"[tensorboard] Logging to: {tb_dir}")
+    else:
+        tb_writer = None
+        print("[tensorboard] SummaryWriter not available (install torch or tensorboardX).")
 
-    # Data iterator (streaming)
-    next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
+    # Data iterator: synthetic toy env (默认) 或 Meta-World 离线数据集
+    if cfg.data_dir is None or cfg.data_dir == "":
+        next_batch = make_iterator(
+            cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
+            pixels_per_step=cfg.pixels_per_step,
+            size_min=cfg.size_min, size_max=cfg.size_max,
+            hold_min=cfg.hold_min, hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
+        T_train = cfg.T
+        H_data, W_data, C_data = cfg.H, cfg.W, cfg.C
+    else:
+        # Meta-World 离线 npz 数据
+        import os, glob
+        NPZ_GLOB = os.path.join(cfg.data_dir, "*.npz")
+        npz_paths = sorted(glob.glob(NPZ_GLOB))
+        if not npz_paths:
+            raise FileNotFoundError(f"[bc_rew] 未在 {cfg.data_dir} 下找到匹配 {NPZ_GLOB} 的 npz 文件")
+
+        _next_batch, (T_raw, H_data, W_data, C_data) = make_offline_iterator_npz_multi(
+            npz_paths,
+            batch_size=cfg.B,
+            seed=0,
+            video_key=cfg.video_key,
+            action_key=cfg.action_key,
+            reward_key=cfg.reward_key,
+        )
+
+        if cfg.T <= 0 or cfg.T > T_raw:
+            raise ValueError(
+                f"[bc_rew] cfg.T={cfg.T} 非法，应在 1..{T_raw} 之间 "
+                f"(由离线数据集时间长度 T_raw 推断)"
+            )
+        T_train = cfg.T
+
+        def next_batch(rng):
+            """从离线 Meta-World 数据集中采样 batch，并在时间维上随机裁剪到长度 T_train。"""
+            rng, (frames, actions, rewards) = _next_batch(rng)
+            T_full = frames.shape[1]
+            if T_full > T_train:
+                rng, subkey = jax.random.split(rng)
+                start = int(
+                    jax.random.randint(
+                        subkey, shape=(), minval=0, maxval=T_full - T_train + 1
+                    )
+                )
+                frames = frames[:, start:start + T_train]
+                actions = actions[:, start:start + T_train]
+                rewards = rewards[:, start:start + T_train]
+            else:
+                frames = frames[:, :T_train]
+                actions = actions[:, :T_train]
+                rewards = rewards[:, :T_train]
+            return rng, (frames, actions, rewards)
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
@@ -943,7 +1044,7 @@ def run(cfg: RealismConfig):
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
+        H=H_data, W=W_data, C=C_data, patch=patch,
         k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
         tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
         cfg=asdict(cfg),
@@ -1010,11 +1111,15 @@ def run(cfg: RealismConfig):
             w_shortcut = float(aux['w_shortcut'])
             w_pi_ce = float(aux['w_pi_ce'])
             w_rw_ce = float(aux['w_rw_ce'])
+            loss_total = float(w_shortcut + w_pi_ce + w_rw_ce)
             step_time = time.time() - train_step_start_time
             total_time = time.time() - start_wall
+            steps_per_sec = 1.0 / max(step_time, 1e-9)
+            self_fraction_effective = float(B_self / max(cfg.B, 1))
 
             pieces = [
                 f"[train] step={step:06d}",
+                f"loss={loss_total:.6g}",
                 f"flow_mse={flow_mse:.6g}",
                 f"boot_mse={boot_mse:.6g}",
                 f"w_pi_ce={w_pi_ce:.4f}",
@@ -1027,6 +1132,7 @@ def run(cfg: RealismConfig):
             # Log to wandb
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
+                    "train/loss_total": loss_total,
                     "train/flow_mse": flow_mse,
                     "train/bootstrap_mse": boot_mse,
                     "train/pi_ce": pi_ce,
@@ -1034,10 +1140,27 @@ def run(cfg: RealismConfig):
                     "train/w_shortcut": w_shortcut,
                     "train/w_pi_ce": w_pi_ce,
                     "train/w_rw_ce": w_rw_ce,
+                    "train/lr": cfg.lr,
+                    "train/self_fraction_effective": self_fraction_effective,
+                    "train/steps_per_sec": steps_per_sec,
                     "train/step_time": step_time,
                     "train/total_time": total_time,
                     "step": step,
                 }, step=step)
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/loss_total", loss_total, step)
+                tb_writer.add_scalar("train/flow_mse", flow_mse, step)
+                tb_writer.add_scalar("train/bootstrap_mse", boot_mse, step)
+                tb_writer.add_scalar("train/pi_ce", pi_ce, step)
+                tb_writer.add_scalar("train/rw_ce", rw_ce, step)
+                tb_writer.add_scalar("train/w_shortcut", w_shortcut, step)
+                tb_writer.add_scalar("train/w_pi_ce", w_pi_ce, step)
+                tb_writer.add_scalar("train/w_rw_ce", w_rw_ce, step)
+                tb_writer.add_scalar("train/lr", cfg.lr, step)
+                tb_writer.add_scalar("train/self_fraction_effective", self_fraction_effective, step)
+                tb_writer.add_scalar("train/steps_per_sec", steps_per_sec, step)
+                tb_writer.add_scalar("train/step_time", step_time, step)
+                tb_writer.add_scalar("train/total_time", total_time, step)
 
         # Save (async) when policy says we should
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
@@ -1051,10 +1174,13 @@ def run(cfg: RealismConfig):
                 train_state=train_state,
                 next_batch=next_batch,
                 vis_dir=vis_dir,
+                tb_writer=tb_writer,
             )
 
     # Ensure all writes finished
     mngr.wait_until_finished()
+    if tb_writer is not None:
+        tb_writer.close()
 
     # Save final config
     (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
@@ -1067,23 +1193,37 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_bc_rew_flippedrew_test",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
+        run_name="bc_rew_button_press",
+        tokenizer_ckpt="/home/ywwang/dreamer4-jax/logs/tokenizer/checkpoints",
+        pretrained_dyn_ckpt="/home/ywwang/dreamer4-jax/logs/dynamics_button_press/checkpoints",
+        log_dir="/home/ywwang/dreamer4-jax/logs",
         use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-        max_steps=1_000_000_000,
-        log_every=5_000,
-        lr=1e-4,
-        write_video_every=100_000,
-        ckpt_save_every=100_000,
+        wandb_entity=None,
+        wandb_project=None,
+        max_steps=200_000,
+        log_every=100,
+        lr=3e-4,
+        write_video_every=1000,
+        ckpt_save_every=50_000,
         ckpt_max_to_keep=2,
+        B=32,
+        T=8,
+        H=64,
+        W=64,
+        C=3,
+        
+        # Meta-World button_press 离线数据集
+        data_dir="/home/ywwang/dreamer4-jax/metaworld_10tasks_200eps/button_press/eval_eps",
+        video_key="image",
+        action_key="action",
+        reward_key="reward",
+        action_dim=4,
         loss_weight_shortcut=1.0,
         loss_weight_policy=0.3,
         loss_weight_reward=0.3,
-        action_dim=4,
     )
-    print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
+    print(
+        "Running realism config:\n  "
+        + "\n  ".join([f"{k}={v}" for k, v in asdict(cfg).items()])
+    )
     run(cfg)

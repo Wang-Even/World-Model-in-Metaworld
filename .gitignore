@@ -3,6 +3,11 @@ overfit_exps/
 *.out
 slurm_outs/
 run_job.sh
+.conda-veorl/
+.local-xvfb/
+MUJOCO_LOG.TXT
+lpips/
+metaworld_10tasks_200eps/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

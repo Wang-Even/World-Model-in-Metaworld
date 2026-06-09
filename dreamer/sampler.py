@@ -168,8 +168,8 @@ def denoise_single_latent(
     *,
     dynamics: Dynamics,
     dyn_vars: Dict[str, Any],
-    actions_ctx: jnp.ndarray,     # (B, T_ctx)
-    action_curr: jnp.ndarray,     # (B, 1)
+    actions_ctx: jnp.ndarray,     # (B, T_ctx, ...)  或 (B, T_ctx)
+    action_curr: jnp.ndarray,     # (B, 1, ...)      或 (B, 1)
     z_ctx_clean: jnp.ndarray,     # (B, T_ctx, n_spatial, D_s) clean context
     z_t_init: jnp.ndarray,        # (B, 1, n_spatial, D_s) initial latent at tau0
     k_max: int,
@@ -193,8 +193,9 @@ def denoise_single_latent(
     """
     B, T_ctx, n_spatial, D_s = z_ctx_clean.shape
     _assert_power_of_two(k_max)
-    assert actions_ctx.shape == (B, T_ctx)
-    assert action_curr.shape == (B, 1)
+    # 允许连续动作带额外维度: (B, T_ctx, A_dim) / (B, 1, A_dim)
+    assert actions_ctx.shape[0] == B and actions_ctx.shape[1] == T_ctx
+    assert action_curr.shape[0] == B and action_curr.shape[1] == 1
 
     # 1) choose tau0
     rng_key, r_tau, r_noise, r_ctx = jax.random.split(rng_key, 4)
@@ -234,8 +235,8 @@ def denoise_single_latent(
             z_ctx_tau = z_ctx_clean
 
         # Build sequence and indices
-        z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                   # (B, T_ctx+1, n_spatial, D_s)
-        actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
+        z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                        # (B, T_ctx+1, n_spatial, D_s)
+        actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)       # (B, T_ctx+1, ...) 或 (B, T_ctx+1)
         step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
         signal_idx = jnp.full((B, T_ctx + 1), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
 
@@ -273,7 +274,7 @@ def sample_video(
     dec_vars: Dict[str, Any],
     dyn_vars: Dict[str, Any],
     frames: jnp.ndarray,     # (B,T,H,W,C)
-    actions: jnp.ndarray,    # (B,T)
+    actions: jnp.ndarray,    # (B,T) 或 (B,T,action_dim) 连续控制
     config: SamplerConfig,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     B, T, H, W, C = frames.shape

@@ -534,12 +534,12 @@ class Decoder(nn.Module):
 
 class ActionEncoder(nn.Module):
     d_model: int
-    n_keyboard: int = 5  # up, down, left, right, null (categorical actions)
+    n_keyboard: int = 5  # 保留字段，不再使用离散动作分支
 
     @nn.compact
     def __call__(
         self,
-        actions: Optional[jnp.ndarray],           # (B, T) int32 in [0, n_keyboard)
+        actions: Optional[jnp.ndarray],           # (B,T,...) float32 连续动作，或 None
         batch_time_shape: Optional[Tuple[int,int]] = None,
         as_tokens: bool = True,
     ):
@@ -554,13 +554,27 @@ class ActionEncoder(nn.Module):
             B, T = batch_time_shape
             out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
         else:
-            # embed categorical actions
-            emb_key = nn.Embed(self.n_keyboard, self.d_model, name="emb_key")(actions)
-            out = emb_key + base_emb  # broadcast add
+            # 连续动作: 将除 (B,T) 外的维度展平，再映射到 d_model。
+            # 注意：为了与已有 ckpt 对齐，仅保留 act_dense1 + base_action_emb。
+            x = actions.astype(jnp.float32)
+            # 归一化形状为 (B,T,feat)
+            if x.ndim == 1:
+                # (T,) -> (1,T,1)
+                x = x[None, :, None]
+            elif x.ndim == 2:
+                # (B,T) -> (B,T,1)
+                B, T = x.shape
+                x = x.reshape(B, T, 1)
+            else:
+                # (B,T,...) -> (B,T,A_flat)
+                B, T = x.shape[:2]
+                x = x.reshape(B, T, -1)
+            x = nn.tanh(nn.Dense(self.d_model, name="act_dense1")(x))   # (B,T,D)
+            out = x + base_emb  # (B,T,D)
 
         if as_tokens:
             # expand a token axis (S_a = 1)
-            out = out[:, :, None, :]
+            out = out[:, :, None, :]  # (B,T,1,D)
 
         return out
 

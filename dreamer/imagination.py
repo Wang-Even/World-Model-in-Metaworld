@@ -10,7 +10,6 @@ import numpy as np
 from einops import reduce
 from pathlib import Path
 import imageio
-import matplotlib.pyplot as plt
 import time
 
 from dreamer.models import Dynamics, TaskEmbedder
@@ -150,8 +149,8 @@ def denoise_single_latent_static(
     dynamics: Dynamics,
     dyn_vars: Dict[str, Any],
     schedule: DenoiseSchedule,
-    actions_ctx: jnp.ndarray,  # (B, T_ctx)
-    action_curr: jnp.ndarray,  # (B, 1)
+    actions_ctx: jnp.ndarray,  # (B, T_ctx) int ids 或 (B, T_ctx, A) one-hot
+    action_curr: jnp.ndarray,  # (B, 1)     int ids 或 (B, 1, A)
     z_ctx_clean: jnp.ndarray,  # (B, T_ctx, n_spatial, D_s)
     z_t_init: jnp.ndarray,     # (B, 1, n_spatial, D_s)
     agent_tokens: jnp.ndarray | None = None,  # (B, T_ctx+1, n_agent, d_model)
@@ -197,14 +196,43 @@ def denoise_single_latent_static(
 
         # Build sequence and indices
         z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)  # (B, T_ctx+1, n_spatial, D_s)
-        actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
+
+        # -------- Action handling (discrete 或 连续) --------
+        # 两种模式：
+        #   1) 离散动作: actions_ctx 形状 (B,T_ctx)，action_curr (B,1)
+        #      - 先在时间维拼接 → (B,T_ctx+1)，再 one-hot 成 (B,T_ctx+1,4)
+        #   2) 连续动作: actions_ctx 形状 (B,T_ctx,4)，action_curr (B,1,4)
+        #      - 直接在时间维拼接，保持最后一维为 action_dim=4
+        if actions_ctx.ndim == 3:
+            # 连续动作模式
+            if action_curr.ndim == 2:
+                # (B,1) int id → one-hot (B,1,4)
+                action_curr_cont = jax.nn.one_hot(
+                    action_curr.astype(jnp.int32),
+                    4,
+                ).astype(jnp.float32)
+            else:
+                action_curr_cont = action_curr
+            actions_full = jnp.concatenate(
+                [actions_ctx, action_curr_cont], axis=1
+            )  # (B, T_ctx+1, 4)
+            actions_dyn = actions_full
+        else:
+            # 离散动作模式
+            actions_full = jnp.concatenate(
+                [actions_ctx, action_curr], axis=1
+            )  # (B, T_ctx+1)
+            actions_dyn = jax.nn.one_hot(
+                actions_full.astype(jnp.int32),
+                4,
+            ).astype(jnp.float32)  # (B, T_ctx+1, 4)
 
         step_idx = jnp.full((B, T_ctx + 1), schedule.step_idx, dtype=jnp.int32)
         signal_idx = jnp.full((B, T_ctx + 1), signal_idx_scalar, dtype=jnp.int32)
 
         z_clean_pred_seq, h_seq = dynamics.apply(
             dyn_vars,
-            actions_full,
+            actions_dyn,
             step_idx,
             signal_idx,
             z_seq,
@@ -307,7 +335,7 @@ def imagine_rollouts_core(
     task_vars: Dict[str, Any],
     schedule: DenoiseSchedule,
     z_context: jnp.ndarray,        # (B, context_length, n_spatial, d_spatial)
-    context_actions: jnp.ndarray,  # (B, context_length)
+    context_actions: jnp.ndarray,  # (B, context_length) int ids 或 (B, context_length, A)
     task_ids: jnp.ndarray,         # (B,)
     horizon: int,
     policy_fn: PolicyFn,
@@ -333,7 +361,10 @@ def imagine_rollouts_core(
     B, context_length, n_spatial, D_s = z_context.shape
 
     z_ctx_clean = z_context  # (B, context_length, n_spatial, d_spatial)
-    actions_ctx = context_actions  # (B, context_length)
+    actions_ctx = context_actions  # (B, context_length) 或 (B, context_length, A)
+
+    # 当前是否处于“连续动作”模式（例如 Meta-World: (B,T,4)）
+    continuous_actions = actions_ctx.ndim == 3
 
     # Pre-compute agent tokens for entire rollout.
     agent_tokens_full = task_embedder.apply(
@@ -346,9 +377,19 @@ def imagine_rollouts_core(
     signal_idx_ctx = jnp.full((B, context_length), schedule.k_max - 1, dtype=jnp.int32)
 
     # Initial hidden state from context.
+    # 连续模式: 直接用 (B,T,4) 连续动作；
+    # 离散模式: 将 (B,T) id one-hot 成 (B,T,4)。
+    if actions_ctx.ndim == 2:
+        actions_ctx_dyn = jax.nn.one_hot(
+            actions_ctx.astype(jnp.int32),
+            4,
+        ).astype(jnp.float32)
+    else:
+        actions_ctx_dyn = actions_ctx
+
     _, h_ctx_init = dynamics.apply(
         dyn_vars,
-        actions_ctx,
+        actions_ctx_dyn,
         step_idx_ctx,
         signal_idx_ctx,
         z_ctx_clean,
@@ -372,7 +413,17 @@ def imagine_rollouts_core(
         # Policy: actions + logits
         actions_t, logits_t, policy_state_next = policy_fn(h_t, policy_key, policy_state_t)
         actions_t = actions_t.astype(jnp.int32)
-        action_curr = actions_t[:, None]  # (B, 1)
+
+        # 根据模式构造当前步动作:
+        #   - 离散: (B,1) int
+        #   - 连续: (B,1,4) one-hot 连续向量
+        if continuous_actions:
+            action_curr = jax.nn.one_hot(
+                actions_t,
+                4,
+            ).astype(jnp.float32)[:, None, :]  # (B,1,4)
+        else:
+            action_curr = actions_t[:, None]  # (B,1)
 
         # τ-ladder noise for latent and (optionally) context.
         z0 = jax.random.normal(
@@ -409,9 +460,15 @@ def imagine_rollouts_core(
         z_ctx_next = jnp.concatenate(
             [z_ctx_clean_t, z_clean_pred], axis=1
         )[:, -context_length:, :, :]
+
+        # 更新动作上下文（保持离散 / 连续形状一致）
         actions_ctx_next = jnp.concatenate(
             [actions_ctx_t, action_curr], axis=1
-        )[:, -context_length:]
+        )
+        if continuous_actions:
+            actions_ctx_next = actions_ctx_next[:, -context_length:, :]
+        else:
+            actions_ctx_next = actions_ctx_next[:, -context_length:]
 
         carry_next = (z_ctx_next, actions_ctx_next, h_next, policy_state_next, rng_t)
 

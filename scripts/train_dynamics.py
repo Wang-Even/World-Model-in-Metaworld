@@ -1,8 +1,3 @@
-# train_dynamics.py
-# Streaming-batch training on synthetic data with teacher-forced training and autoregressive evaluation.
-# This version keeps ONLY the efficient training step and adds robust Orbax checkpointing.
-# It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
-
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -18,6 +13,16 @@ import numpy as np
 import optax
 import imageio.v2 as imageio
 import orbax.checkpoint as ocp
+TBWriter = None
+try:
+    from torch.utils.tensorboard import SummaryWriter as _TBWriter
+    TBWriter = _TBWriter
+except Exception:
+    try:
+        from tensorboardX import SummaryWriter as _TBWriter  # type: ignore
+        TBWriter = _TBWriter
+    except Exception:
+        TBWriter = None
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -27,6 +32,7 @@ except ImportError:
 
 from dreamer.models import Encoder, Decoder, Dynamics
 from dreamer.data import make_iterator
+from dreamer.offline_data import make_offline_iterator_npz_multi
 from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
@@ -95,6 +101,19 @@ class RealismConfig:
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+    write_mp4: bool = False          # if False, skip mp4 generation and export frame PNGs only
+    eval_frame_stride: int = 1       # save every N-th frame from eval grids
+    eval_max_frames: int = 64        # cap exported frame count per eval tag
+    tb_log_video: bool = False       # if False, TensorBoard logs image sequence instead of add_video
+
+    # offline dataset (Meta-World) config
+    # 如果 data_dir 为 None，则使用合成小方块环境；否则使用指定目录下的 npz 数据集。
+    data_dir: str | None = None
+    video_key: str = "image"
+    action_key: str = "action"
+    reward_key: str = "reward"
+    # 用于 dynamics 训练和 eval 的时间长度（从完整轨迹中裁剪）
+    context_len: int = 8
 
 # ---------------------------
 # Small helpers
@@ -315,6 +334,7 @@ def train_step_efficient(
         loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
 
         aux = {
+            "loss_total": loss,
             "flow_mse": jnp.mean(flow_per),
             "bootstrap_mse": boot_mse,
         }
@@ -329,13 +349,13 @@ def train_step_efficient(
 # Eval regimes & plan JSON (unchanged core logic)
 # ---------------------------
 
-def _eval_regimes_for_realism(cfg, *, ctx_length: int):
+def _eval_regimes_for_realism(cfg, *, ctx_length: int, H: int, W: int, C: int, patch: int, T_total: int):
     common = dict(
         k_max=cfg.k_max,
-        horizon=min(32, cfg.T - ctx_length),
+        horizon=min(32, T_total - ctx_length),
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
+        H=H, W=W, C=C, patch=patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
         start_mode="pure",
@@ -451,6 +471,78 @@ def save_evaluation_video(
         print(f"[eval:{tag}] MP4 write skipped ({e})")
         return False
 
+def save_evaluation_frames(
+    grid_frames: list[np.ndarray],
+    output_dir: Path,
+    *,
+    tag: str,
+    frame_stride: int = 1,
+    max_frames: int = 64,
+) -> int:
+    """
+    Save sampled grid frames as PNG files for visual comparison.
+
+    Returns:
+        Number of frames successfully written.
+    """
+    if not grid_frames:
+        return 0
+
+    stride = max(1, int(frame_stride))
+    idx = list(range(0, len(grid_frames), stride))
+    if max_frames > 0 and len(idx) > max_frames:
+        pick = np.linspace(0, len(idx) - 1, max_frames, dtype=np.int32)
+        idx = [idx[i] for i in pick]
+
+    written = 0
+    for t_idx in idx:
+        out_path = output_dir / f"{tag}_t{t_idx:03d}.png"
+        try:
+            imageio.imwrite(out_path, grid_frames[t_idx])
+            written += 1
+        except Exception as e:
+            print(f"[eval:{tag}] PNG frame write skipped at t={t_idx} ({e})")
+    return written
+
+def log_grid_frames_to_tensorboard(
+    tb_writer,
+    *,
+    tag: str,
+    step: int,
+    grid_frames: list[np.ndarray],
+    fps: int = 10,
+    prefer_video: bool = False,
+):
+    """
+    Log tiled evaluation frames to TensorBoard.
+    Tries add_video first; if backend is unavailable, falls back to add_images.
+    """
+    if tb_writer is None or not grid_frames:
+        return
+
+    frames_np = np.asarray(grid_frames)  # (T, H, W, C)
+    if frames_np.ndim != 4 or frames_np.shape[-1] not in (1, 3, 4):
+        return
+
+    sampled_n = min(64, frames_np.shape[0])
+    idx = np.linspace(0, frames_np.shape[0] - 1, sampled_n, dtype=np.int32)
+    frames_np = frames_np[idx]
+
+    video = frames_np.astype(np.float32)
+    if video.max() > 1.0:
+        video = video / 255.0
+
+    # (T,H,W,C) -> (1,T,C,H,W) for TensorBoard video
+    video_n = np.transpose(video, (0, 3, 1, 2))[None, ...]
+    if prefer_video:
+        try:
+            tb_writer.add_video(tag, video_n, global_step=step, fps=fps)
+            return
+        except Exception:
+            pass
+    # Default/fallback: show as image sequence (T,C,H,W)
+    tb_writer.add_images(f"{tag}_frames", video_n[0], global_step=step)
+
 def save_evaluation_plan(
     sampler_conf: SamplerConfig,
     step: int,
@@ -541,9 +633,11 @@ def initialize_models_and_tokenizer(
     Returns:
         TrainState containing all initialized models, variables, and optimizer state.
     """
+    # 推断实际 H, W, C（来自数据集），不再依赖 cfg.H/W/C
+    B_init, T_init, H, W, C = frames_init.shape
     patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
+    num_patches = (H // patch) * (W // patch)
+    D_patch = patch * patch * C
     k_max = cfg.k_max
 
     enc_kwargs = dict(
@@ -586,7 +680,8 @@ def initialize_models_and_tokenizer(
     patches_btnd = temporal_patchify(frames_init, patch)
     rng = jax.random.PRNGKey(0)
     enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
+    # decoder 初始化时 B/T 只影响占位形状，直接用当前 batch 的尺寸即可
+    fake_z = jnp.zeros((B_init, T_init, cfg.enc_n_latents, cfg.enc_d_bottleneck))
     dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
 
     # Restore tokenizer
@@ -602,8 +697,10 @@ def initialize_models_and_tokenizer(
     z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
+    # 对 dynamics 来说，只需要 batch/time 维度与 actions_init / z1 对齐
+    B_dyn, T_dyn = actions_init.shape[:2]
+    step_idx = jnp.full((B_dyn, T_dyn), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((B_dyn, T_dyn), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
     params = dyn_vars["params"]
 
@@ -636,6 +733,7 @@ def run_evaluation(
     train_state: TrainState,
     next_batch,
     vis_dir: Path,
+    tb_writer=None,
 ):
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
@@ -650,8 +748,17 @@ def run_evaluation(
     val_rng = jax.random.PRNGKey(9999)
     _, (val_frames, val_actions, _) = next_batch(val_rng)
     dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params)
-    ctx_length = min(32, cfg.T - 1)
-    regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
+    B_eval, T_total, H, W, C = val_frames.shape
+    ctx_length = min(32, T_total - 1)
+    regimes = _eval_regimes_for_realism(
+        cfg,
+        ctx_length=ctx_length,
+        H=H,
+        W=W,
+        C=C,
+        patch=cfg.patch,
+        T_total=T_total,
+    )
 
     for tag, sampler_conf in regimes:
         sampler_conf.mae_eval_key = train_state.mae_eval_key
@@ -679,18 +786,48 @@ def run_evaluation(
             gt_frames=gt_frames,
             floor_frames=floor_frames,
             pred_frames=pred_frames,
-            batch_size=cfg.B,
+            batch_size=B_eval,
         )
 
         # Save video and plan
         tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
-        mp4_path = tag_dir / f"{tag}_grid.mp4"
         plan_path = tag_dir / f"{tag}_plan.json"
+        frame_dir = _ensure_dir(tag_dir / "frames")
+        mp4_path = tag_dir / f"{tag}_grid.mp4"
 
-        save_evaluation_video(grid_frames, mp4_path, tag)
+        saved_frames = save_evaluation_frames(
+            grid_frames,
+            frame_dir,
+            tag=tag,
+            frame_stride=cfg.eval_frame_stride,
+            max_frames=cfg.eval_max_frames,
+        )
+        mp4_written = False
+        if cfg.write_mp4:
+            mp4_written = save_evaluation_video(grid_frames, mp4_path, tag)
         save_evaluation_plan(sampler_conf, step, mse, psnr, plan_path)
+        log_grid_frames_to_tensorboard(
+            tb_writer,
+            tag=f"eval/{tag}/grid_video",
+            step=step,
+            grid_frames=grid_frames,
+            fps=10,
+            prefer_video=cfg.tb_log_video,
+        )
+        if tb_writer is not None:
+            tb_writer.add_scalar(f"eval/{tag}/mse", mse, step)
+            tb_writer.add_scalar(f"eval/{tag}/psnr", psnr, step)
+            tb_writer.add_scalar(f"eval/{tag}/horizon", HZ, step)
+            tb_writer.add_scalar(f"eval/{tag}/eval_time", dt, step)
 
-        print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
+        if cfg.write_mp4 and mp4_written:
+            print(
+                f"[eval:{tag}] wrote {saved_frames} frame PNGs, {mp4_path.name}, and {plan_path.name} in {tag_dir}"
+            )
+        else:
+            print(
+                f"[eval:{tag}] wrote {saved_frames} frame PNGs and {plan_path.name} in {tag_dir}"
+            )
 
         # Log to wandb
         if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
@@ -701,7 +838,7 @@ def run_evaluation(
                 f"eval/{tag}/horizon": HZ,
                 f"eval/{tag}/eval_time": dt,
             }, step=step)
-            if grid_frames:
+            if cfg.write_mp4 and mp4_written and grid_frames:
                 wandb.log({
                     f"eval/{tag}/video": wandb.Video(mp4_path, format="mp4"),
                 }, step=step)
@@ -732,19 +869,79 @@ def run(cfg: RealismConfig):
     run_dir = _ensure_dir(root / cfg.run_name)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
+    tb_dir = _ensure_dir(run_dir / "tb")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
+    if TBWriter is not None:
+        tb_writer = TBWriter(log_dir=str(tb_dir))
+        print(f"[tensorboard] Logging to: {tb_dir}")
+    else:
+        tb_writer = None
+        print("[tensorboard] SummaryWriter not available (install torch or tensorboardX).")
 
-    # Data iterator (streaming)
-    next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
+    # Data iterator
+    # 如果 cfg.data_dir 为空，则使用原来的合成小方块环境；
+    # 否则从 Meta-World 离线 npz 数据集采样 (image, action, reward)。
+    if cfg.data_dir is None:
+        next_batch = make_iterator(
+            cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
+            pixels_per_step=cfg.pixels_per_step,
+            size_min=cfg.size_min, size_max=cfg.size_max,
+            hold_min=cfg.hold_min, hold_max=cfg.hold_max,
+            fg_min_color=0 if cfg.diversify_data else 128,
+            fg_max_color=255 if cfg.diversify_data else 128,
+            bg_min_color=0 if cfg.diversify_data else 255,
+            bg_max_color=255 if cfg.diversify_data else 255,
+        )
+        # 对于合成数据，T_train 直接等于 cfg.T，H/W/C 也用配置值
+        T_train = cfg.T
+        H_data, W_data, C_data = cfg.H, cfg.W, cfg.C
+    else:
+        import os, glob
+        NPZ_GLOB = os.path.join(cfg.data_dir, "*.npz")
+        npz_paths = sorted(glob.glob(NPZ_GLOB))
+        if not npz_paths:
+            raise FileNotFoundError(f"[dynamics] 未在 {cfg.data_dir} 下找到匹配 {NPZ_GLOB} 的 npz 文件")
+
+        _next_batch, (T_raw, H_data, W_data, C_data) = make_offline_iterator_npz_multi(
+            npz_paths,
+            batch_size=cfg.B,
+            seed=0,
+            video_key=cfg.video_key,
+            action_key=cfg.action_key,
+            reward_key=cfg.reward_key,
+        )
+
+        if cfg.context_len <= 0 or cfg.context_len > T_raw:
+            raise ValueError(
+                f"[dynamics] context_len={cfg.context_len} 非法，应在 1..{T_raw} 之间 "
+                f"(由离线数据集时间长度 T_raw 推断)"
+            )
+        T_train = cfg.context_len
+
+        def next_batch(rng):
+            """从离线 Meta-World 数据集中采样 batch，并在时间维上随机裁剪到长度 T_train。
+
+            注意：此处保留连续动作向量 (B,T,A_dim)，让 Dynamics 的 ActionEncoder
+            使用连续分支（MLP）编码 action token，而不再手工离散化。
+            """
+            rng, (frames, actions, rewards) = _next_batch(rng)  # frames: (B, T_raw, H, W, C)
+            T_full = frames.shape[1]
+            if T_full > T_train:
+                rng, subkey = jax.random.split(rng)
+                start = int(
+                    jax.random.randint(
+                        subkey, shape=(), minval=0, maxval=T_full - T_train + 1
+                    )
+                )
+                frames = frames[:, start:start + T_train]
+                actions = actions[:, start:start + T_train]
+                rewards = rewards[:, start:start + T_train]
+            else:
+                frames = frames[:, :T_train]
+                actions = actions[:, :T_train]
+                rewards = rewards[:, :T_train]
+
+            return rng, (frames, actions, rewards)
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
@@ -763,7 +960,7 @@ def run(cfg: RealismConfig):
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
+        H=H_data, W=W_data, C=C_data, patch=patch,
         k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
         tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
         cfg=asdict(cfg),
@@ -788,71 +985,116 @@ def run(cfg: RealismConfig):
     data_rng = jax.random.PRNGKey(12345)
 
     start_wall = time.time()
-    for step in range(start_step, cfg.max_steps + 1):
-        # Data
-        data_rng, batch_key = jax.random.split(data_rng)
-        _, (frames, actions, _) = next_batch(batch_key)
+    last_step = start_step
+    try:
+        for step in range(start_step, cfg.max_steps + 1):
+            # Data
+            data_rng, batch_key = jax.random.split(data_rng)
+            _, (frames, actions, _) = next_batch(batch_key)
 
-        # RNG for this step
-        train_rng, master_key = jax.random.split(train_rng)
+            # RNG for this step
+            train_rng, master_key = jax.random.split(train_rng)
 
-        # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
-        # and gate its contribution inside the jit via bootstrap_start masking).
-        B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
+            # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
+            # and gate its contribution inside the jit via bootstrap_start masking).
+            B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
 
-        train_step_start_time = time.time()
-        train_state.params, train_state.opt_state, aux = train_step_efficient(
-            train_state.encoder, train_state.dynamics, train_state.tx,
-            train_state.params, train_state.opt_state,
-            train_state.enc_vars, train_state.dyn_vars,
-            frames, actions,
-            patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
-            n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
-            master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
-        )
-
-        # Logging
-        if (step % cfg.log_every == 0) or (step == cfg.max_steps):
-            flow_mse = float(aux['flow_mse'])
-            boot_mse = float(aux['bootstrap_mse'])
-            step_time = time.time() - train_step_start_time
-            total_time = time.time() - start_wall
-
-            pieces = [
-                f"[train] step={step:06d}",
-                f"flow_mse={flow_mse:.6g}",
-                f"boot_mse={boot_mse:.6g}",
-                f"t={step_time:.4f}s",
-                f"total_t={total_time:.1f}s",
-            ]
-            print(" | ".join(pieces))
-
-            # Log to wandb
-            if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log({
-                    "train/flow_mse": flow_mse,
-                    "train/bootstrap_mse": boot_mse,
-                    "train/step_time": step_time,
-                    "train/total_time": total_time,
-                    "step": step,
-                }, step=step)
-
-        # Save (async) when policy says we should
-        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
-        maybe_save(mngr, step, state, meta)
-
-        # Periodic lightweight AR eval
-        if cfg.write_video_every and (step % cfg.write_video_every == 0):
-            run_evaluation(
-                cfg=cfg,
-                step=step,
-                train_state=train_state,
-                next_batch=next_batch,
-                vis_dir=vis_dir,
+            train_step_start_time = time.time()
+            train_state.params, train_state.opt_state, aux = train_step_efficient(
+                train_state.encoder, train_state.dynamics, train_state.tx,
+                train_state.params, train_state.opt_state,
+                train_state.enc_vars, train_state.dyn_vars,
+                frames, actions,
+                patch=cfg.patch, B=cfg.B, T=T_train, B_self=B_self,
+                n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
+                master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
             )
 
-    # Ensure all writes finished
-    mngr.wait_until_finished()
+            # Logging
+            if (step % cfg.log_every == 0) or (step == cfg.max_steps):
+                total_loss = float(aux["loss_total"])
+                flow_mse = float(aux['flow_mse'])
+                boot_mse = float(aux['bootstrap_mse'])
+                step_time = time.time() - train_step_start_time
+                total_time = time.time() - start_wall
+                steps_per_sec = 1.0 / max(step_time, 1e-9)
+                self_fraction_effective = float(B_self / max(cfg.B, 1))
+
+                pieces = [
+                    f"[train] step={step:06d}",
+                    f"loss={total_loss:.6g}",
+                    f"flow_mse={flow_mse:.6g}",
+                    f"boot_mse={boot_mse:.6g}",
+                    f"t={step_time:.4f}s",
+                    f"total_t={total_time:.1f}s",
+                ]
+                print(" | ".join(pieces))
+
+                # Log to wandb
+                if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
+                    wandb.log({
+                        "train/loss_total": total_loss,
+                        "train/flow_mse": flow_mse,
+                        "train/bootstrap_mse": boot_mse,
+                        "train/lr": cfg.lr,
+                        "train/self_fraction_effective": self_fraction_effective,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/step_time": step_time,
+                        "train/total_time": total_time,
+                        "step": step,
+                    }, step=step)
+                if tb_writer is not None:
+                    tb_writer.add_scalar("train/loss_total", total_loss, step)
+                    tb_writer.add_scalar("train/flow_mse", flow_mse, step)
+                    tb_writer.add_scalar("train/bootstrap_mse", boot_mse, step)
+                    tb_writer.add_scalar("train/lr", cfg.lr, step)
+                    tb_writer.add_scalar("train/self_fraction_effective", self_fraction_effective, step)
+                    tb_writer.add_scalar("train/steps_per_sec", steps_per_sec, step)
+                    tb_writer.add_scalar("train/step_time", step_time, step)
+                    tb_writer.add_scalar("train/total_time", total_time, step)
+
+            # Save (async) when policy says we should
+            state = make_state(train_state.params, train_state.opt_state, train_rng, step)
+            maybe_save(mngr, step, state, meta)
+            last_step = step
+
+            # Periodic lightweight AR eval
+            if cfg.write_video_every and (step % cfg.write_video_every == 0):
+                run_evaluation(
+                    cfg=cfg,
+                    step=step,
+                    train_state=train_state,
+                    next_batch=next_batch,
+                    vis_dir=vis_dir,
+                    tb_writer=tb_writer,
+                )
+    except KeyboardInterrupt:
+        print(f"\n[KeyboardInterrupt] Saving final dynamics checkpoint at step {last_step} ...")
+        state = make_state(train_state.params, train_state.opt_state, train_rng, last_step)
+        save_args = ocp.args.Composite(
+            state=ocp.args.StandardSave(state),
+            meta=ocp.args.JsonSave(meta),
+        )
+        mngr.save(last_step, args=save_args)
+        mngr.wait_until_finished()
+        print(f"[KeyboardInterrupt] Final dynamics checkpoint saved to {ckpt_dir}")
+    except Exception as e:
+        print(f"\n[Exception] {e!r}")
+        print(f"[Exception] Saving final dynamics checkpoint at step {last_step} ...")
+        state = make_state(train_state.params, train_state.opt_state, train_rng, last_step)
+        save_args = ocp.args.Composite(
+            state=ocp.args.StandardSave(state),
+            meta=ocp.args.JsonSave(meta),
+        )
+        mngr.save(last_step, args=save_args)
+        mngr.wait_until_finished()
+        print(f"[Exception] Final dynamics checkpoint saved to {ckpt_dir}. Re-raising.")
+        raise
+    finally:
+        # Ensure all writes finished
+        mngr.wait_until_finished()
+        if tb_writer is not None:
+            tb_writer.close()
 
     # Save final config
     (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
@@ -865,18 +1107,19 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_dynamics_test",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-        max_steps=1_000_000_000,
-        log_every=5_000,
-        lr=1e-4,
-        write_video_every=50_000,
-        ckpt_save_every=50_000,
-        ckpt_max_to_keep=2,
-    )
+    run_name="dynamics_button_press",
+    tokenizer_ckpt="/home/ywwang/dreamer4-jax/logs/tokenizer/checkpoints",
+    log_dir="/home/ywwang/dreamer4-jax/logs",
+    use_wandb=False,
+    max_steps=1000000,
+    log_every=5000,
+    lr=3e-4,
+    write_video_every=50000,
+    ckpt_save_every=50000,
+    ckpt_max_to_keep=2,
+    B=32,
+    context_len=8,
+    data_dir="/home/ywwang/dreamer4-jax/metaworld_10tasks_200eps/button_press/eval_eps",
+)
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)
